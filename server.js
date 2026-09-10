@@ -1,12 +1,10 @@
 // ============================================================
-//   Zylo Backend — FINAL FIXED (Render Deployment)
+//   Zylo Backend — Hybrid (Bypass via CF Worker)
 //   Netflix · Prime · Disney+ · Hotstar
-//   Node.js + Express + Raw HTTPS for Set-Cookie capture
 // ============================================================
 
 import express from "express";
 import cors from "cors";
-import https from "https";
 
 const app = express();
 app.use(cors());
@@ -18,100 +16,34 @@ const USER_AGENT =
   "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 " +
   "Safari/537.36 /OS.Gatu v3.0";
 
+// ⭐ CF Worker URL (bypass ke liye)
+const CF_WORKER = "https://twilight-smoke-5ba9.adityaarya93506.workers.dev";
+
 // ---------------- Caches ----------------
 let cookie_cache = null, cookie_ts = 0;
 let api_base_cache = null, api_base_ts = 0;
 let resolvedApiUrl = "";
 let lastReq = 0;
 
-// ============================================================
-//   Raw HTTPS POST — captures Set-Cookie (undici strips it)
-// ============================================================
-function httpsRawPost(urlStr, headers, body) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    const req = https.request(
-      {
-        hostname: u.hostname,
-        path: u.pathname + u.search,
-        method: "POST",
-        headers,
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => {
-          resolve({
-            status: res.statusCode,
-            headers: res.headers,
-            setCookie: res.headers["set-cookie"] || [],
-            body: data,
-          });
-        });
-      }
-    );
-    req.on("error", reject);
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-// ============================================================
-//   Cloudflare bypass — gets t_hash_t cookie
-// ============================================================
+// ---------------- Bypass via CF Worker ----------------
 async function bypass() {
   if (cookie_cache && Date.now() - cookie_ts < 54_000_000) {
     return cookie_cache;
   }
-
-  const captcha = crypto.randomUUID();
-  const body = "g-recaptcha-response=" + captcha;
-
-  const headers = {
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/x-www-form-urlencoded",
-    Origin: "https://net77.cc",
-    Referer: "https://net77.cc/verify2",
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-    "Content-Length": Buffer.byteLength(body),
-  };
-
   try {
-    const res = await httpsRawPost(
-      "https://net52.cc/verify.php",
-      headers,
-      body
-    );
-
-    console.log("[bypass] status:", res.status);
-    console.log("[bypass] set-cookie count:", res.setCookie.length);
-
-    let value = "";
-    for (const c of res.setCookie) {
-      const m = c.match(/t_hash_t=([^;]+)/);
-      if (m) {
-        value = m[1];
-        break;
-      }
-    }
-
-    if (value) {
-      cookie_cache = value;
+    const r = await fetch(`${CF_WORKER}/api/bypass`);
+    const j = await r.json();
+    if (j.t_hash_t) {
+      cookie_cache = j.t_hash_t;
       cookie_ts = Date.now();
-      console.log("[bypass] cookie found:", value.slice(0, 20) + "...");
-    } else {
-      console.log("[bypass] no t_hash_t in response");
-      console.log("[bypass] raw set-cookie:", JSON.stringify(res.setCookie));
-      console.log("[bypass] body preview:", res.body.slice(0, 200));
+      console.log("[bypass] got cookie:", j.t_hash_t.slice(0, 20) + "...");
+      return j.t_hash_t;
     }
-    return value;
+    console.log("[bypass] no cookie from CF Worker:", JSON.stringify(j));
   } catch (e) {
-    console.error("[bypass] failed:", e.message);
-    return "";
+    console.error("[bypass] CF Worker failed:", e.message);
   }
+  return "";
 }
 
 // ---------------- Base64 + domains ----------------
@@ -260,7 +192,7 @@ async function hsLoad(id, ott) {
   );
 }
 
-// Links — Netflix uses pv for playback
+// Links — Netflix uses "pv" for playback
 async function getLinks(id, ott) {
   const apiBase = await resolveApiUrl();
   const cookie = await bypass();
@@ -320,38 +252,20 @@ async function handleLinks(p, id) {
 // ============================================================
 app.get("/", (_, res) => res.send("Zylo Backend ✅ Running"));
 
-// Debug: bypass
+// Debug bypass
 app.get("/api/debug/bypass", async (_, res) => {
   try {
-    const captcha = crypto.randomUUID();
-    const body = "g-recaptcha-response=" + captcha;
-    const headers = {
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Content-Type": "application/x-www-form-urlencoded",
-      Origin: "https://net77.cc",
-      Referer: "https://net77.cc/verify2",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-      "Content-Length": Buffer.byteLength(body),
-    };
-    const raw = await httpsRawPost(
-      "https://net52.cc/verify.php",
-      headers,
-      body
-    );
+    const c = await bypass();
     res.json({
-      status: raw.status,
-      setCookieHeaders: raw.setCookie,
-      bodyPreview: raw.body.slice(0, 200),
+      ok: !!c,
+      cookie_preview: c ? c.slice(0, 20) + "..." : null,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Debug: resolve
+// Debug resolve
 app.get("/api/debug/resolve", async (_, res) => {
   try {
     const apiBase = await resolveApiUrl();
