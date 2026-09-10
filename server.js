@@ -1,6 +1,6 @@
 // ============================================================
-//   Zylo Backend — Hybrid (Bypass via CF Worker)
-//   Netflix · Prime · Disney+ · Hotstar
+//   Zylo Backend v2 — TMDB + net27.cc embed API
+//   No Cloudflare bypass needed · No cookies · No Puppeteer
 // ============================================================
 
 import express from "express";
@@ -11,314 +11,149 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
 const USER_AGENT =
-  "Mozilla/5.0 (Linux; Android 13; Pixel 5 Build/TQ3A.230901.001; wv) " +
-  "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 " +
-  "Safari/537.36 /OS.Gatu v3.0";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ⭐ CF Worker URL (bypass ke liye)
-const CF_WORKER = "https://twilight-smoke-5ba9.adityaarya93506.workers.dev";
+// net27.cc requires this referer
+const NET27_REFERER = "https://videodownloader.site/";
+const NET27_ORIGIN = "https://videodownloader.site";
+const NET27_BASE = "https://net27.cc";
 
-// ---------------- Caches ----------------
-let cookie_cache = null, cookie_ts = 0;
-let api_base_cache = null, api_base_ts = 0;
-let resolvedApiUrl = "";
-let lastReq = 0;
-
-// ---------------- Bypass via CF Worker ----------------
-async function bypass() {
-  if (cookie_cache && Date.now() - cookie_ts < 54_000_000) {
-    return cookie_cache;
+// ---------------- getStreams (net27.cc embed-tmdb) ----------------
+async function getStreams(tmdbId, type = "movie", season = null, episode = null) {
+  let url = `${NET27_BASE}/api/embed-tmdb/${tmdbId}`;
+  if (type === "tv" && season !== null && episode !== null) {
+    url += `?type=tv&s=${season}&e=${episode}`;
   }
-  try {
-    const r = await fetch(`${CF_WORKER}/api/bypass`);
-    const j = await r.json();
-    if (j.t_hash_t) {
-      cookie_cache = j.t_hash_t;
-      cookie_ts = Date.now();
-      console.log("[bypass] got cookie:", j.t_hash_t.slice(0, 20) + "...");
-      return j.t_hash_t;
-    }
-    console.log("[bypass] no cookie from CF Worker:", JSON.stringify(j));
-  } catch (e) {
-    console.error("[bypass] CF Worker failed:", e.message);
-  }
-  return "";
-}
 
-// ---------------- Base64 + domains ----------------
-const decodeBase64 = (v) => Buffer.from(v, "base64").toString("utf-8");
-
-const newTvDomains = [
-  "aHR0cHM6Ly9tb2JpbGVkZXRlY3RzLmNvbQ==",
-  "aHR0cHM6Ly9tb2JpbGVkZXRlY3QuYXBw",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LmFydA==",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LmNj",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LmNsaWNr",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0Lmluaw==",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LmxpdmU=",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LnBybw==",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LnNob3A=",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LnNpdGU=",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LnNwYWNl",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LnN0b3Jl",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0LnZpcA==",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0Lndpa2k=",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0Lnh5eg==",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy5hcnQ=",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy5jYw==",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy5pbmZv",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy5pbms=",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy5saXZl",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy5wcm8=",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy5zdG9yZQ==",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy50b3A=",
-  "aHR0cHM6Ly9tb2JpZGV0ZWN0cy54eXo=",
-];
-
-const newTvBaseHeaders = {
-  "Cache-Control": "no-cache, no-store, must-revalidate",
-  Pragma: "no-cache",
-  Expires: "0",
-  "X-Requested-With": "NetmirrorNewTV v1.0",
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) " +
-    "Gecko/20100101 Firefox/136.0 /OS.GatuNewTV v1.0",
-  Accept: "application/json, text/plain, */*",
-};
-
-async function throttle() {
-  const wait = 1200 - (Date.now() - lastReq);
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-  lastReq = Date.now();
-}
-
-async function resolveApiUrl() {
-  if (resolvedApiUrl) return resolvedApiUrl;
-  if (api_base_cache && Date.now() - api_base_ts < 86_400_000) {
-    resolvedApiUrl = api_base_cache;
-    return resolvedApiUrl;
-  }
-  for (const enc of newTvDomains) {
-    const base = decodeBase64(enc).replace(/\/+$/, "");
-    try {
-      await throttle();
-      const r = await fetch(`${base}/checknewtv.php`, {
-        headers: newTvBaseHeaders,
-      });
-      const j = await r.json();
-      if (j.token_hash) {
-        resolvedApiUrl = decodeBase64(j.token_hash).replace(/\/+$/, "");
-        api_base_cache = resolvedApiUrl;
-        api_base_ts = Date.now();
-        console.log("[resolveApiUrl]", resolvedApiUrl);
-        return resolvedApiUrl;
-      }
-    } catch {}
-  }
-  throw new Error("API URL resolve fail");
-}
-
-function buildNewTvHeaders(ott, extra = {}) {
-  return { ...newTvBaseHeaders, Ott: ott, ...extra };
-}
-
-// ---------------- Provider logic ----------------
-const MAIN_URL = "https://net52.cc";
-
-const PV_HEADERS = {
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
-  Connection: "keep-alive",
-  "User-Agent": USER_AGENT,
-  "X-Requested-With": "XMLHttpRequest",
-};
-
-async function providerCookies(ott) {
-  const cookie = await bypass();
-  return `t_hash_t=${cookie}; hd=on; ott=${ott}`;
-}
-
-async function safeJson(url, opts = {}) {
-  const r = await fetch(url, opts);
-  const text = await r.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(`Non-JSON (${r.status}): ${text.slice(0, 150)}`);
-  }
-}
-
-// Netflix
-async function nfSearch(q) {
-  return safeJson(
-    `${MAIN_URL}/mobile/search.php?s=${encodeURIComponent(q)}&t=${Math.floor(Date.now() / 1000)}`,
-    { headers: { ...PV_HEADERS, Cookie: await providerCookies("nf"), Referer: `${MAIN_URL}/home` } }
-  );
-}
-async function nfLoad(id) {
-  return safeJson(
-    `${MAIN_URL}/mobile/post.php?id=${id}&t=${Math.floor(Date.now() / 1000)}`,
-    { headers: { ...PV_HEADERS, Cookie: await providerCookies("nf"), Referer: `${MAIN_URL}/home` } }
-  );
-}
-
-// Prime
-async function pvSearch(q) {
-  return safeJson(
-    `${MAIN_URL}/mobile/pv/search.php?s=${encodeURIComponent(q)}&t=${Math.floor(Date.now() / 1000)}`,
-    { headers: { ...PV_HEADERS, Cookie: await providerCookies("pv"), Referer: `${MAIN_URL}/home` } }
-  );
-}
-async function pvLoad(id) {
-  return safeJson(
-    `${MAIN_URL}/mobile/pv/post.php?id=${id}&t=${Math.floor(Date.now() / 1000)}`,
-    { headers: { ...PV_HEADERS, Cookie: await providerCookies("pv"), Referer: `${MAIN_URL}/home` } }
-  );
-}
-
-// Hotstar / Disney
-async function hsSearch(q, ott) {
-  return safeJson(
-    `${MAIN_URL}/mobile/hs/search.php?s=${encodeURIComponent(q)}&t=${Math.floor(Date.now() / 1000)}`,
-    { headers: { ...PV_HEADERS, Cookie: await providerCookies(ott), Referer: `${MAIN_URL}/home` } }
-  );
-}
-async function hsLoad(id, ott) {
-  return safeJson(
-    `${MAIN_URL}/mobile/hs/post.php?id=${id}&t=${Math.floor(Date.now() / 1000)}`,
-    { headers: { ...PV_HEADERS, Cookie: await providerCookies(ott), Referer: `${MAIN_URL}/home` } }
-  );
-}
-
-// Links — Netflix uses "pv" for playback
-async function getLinks(id, ott) {
-  const apiBase = await resolveApiUrl();
-  const cookie = await bypass();
-  const cookieHeader = `t_hash_t=${cookie}; hd=on; ott=${ott}`;
-
-  const url = `${apiBase}/newtv/player.php?id=${id}`;
-  console.log("[getLinks]", url);
+  console.log("[getStreams]", url);
 
   const r = await fetch(url, {
     headers: {
       Accept: "application/json, text/plain, */*",
-      "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      Referer: NET27_REFERER,
+      Origin: NET27_ORIGIN,
       "User-Agent": USER_AGENT,
-      Cookie: cookieHeader,
-      Referer: "https://net52.cc/",
-      Origin: "https://net52.cc",
     },
   });
 
   const text = await r.text();
-  console.log("[getLinks] status:", r.status, "| body:", text.slice(0, 200));
+  console.log("[getStreams] status:", r.status, "| preview:", text.slice(0, 200));
 
-  try {
-    const j = JSON.parse(text);
-    if (j.video_link) return j;
-    throw new Error("No video_link: " + text.slice(0, 150));
-  } catch (e) {
-    throw new Error(`player.php (${r.status}): ${text.slice(0, 150)}`);
+  if (!r.ok) {
+    throw new Error(`net27.cc ${r.status}: ${text.slice(0, 150)}`);
   }
+
+  const j = JSON.parse(text);
+  if (!j.ok) {
+    throw new Error(j.error || "no source available");
+  }
+  return j;
 }
 
-// ---------------- Dispatcher ----------------
-async function handleSearch(p, q) {
-  if (p === "netflix") return nfSearch(q);
-  if (p === "prime") return pvSearch(q);
-  if (p === "disney") return hsSearch(q, "dp");
-  if (p === "hotstar") return hsSearch(q, "hs");
-  throw new Error("Unknown provider: " + p);
-}
-async function handleLoad(p, id) {
-  if (p === "netflix") return nfLoad(id);
-  if (p === "prime") return pvLoad(id);
-  if (p === "disney") return hsLoad(id, "dp");
-  if (p === "hotstar") return hsLoad(id, "hs");
-  throw new Error("Unknown provider: " + p);
-}
-async function handleLinks(p, id) {
-  if (p === "netflix") return getLinks(id, "pv");
-  if (p === "prime") return getLinks(id, "pv");
-  if (p === "disney") return getLinks(id, "dp");
-  if (p === "hotstar") return getLinks(id, "hs");
-  throw new Error("Unknown provider: " + p);
+// ---------------- TMDB search (optional, uses your key) ----------------
+const TMDB_READ_TOKEN = process.env.TMDB_READ_TOKEN || "";
+
+async function tmdbSearch(query, type = "movie") {
+  if (!TMDB_READ_TOKEN) throw new Error("TMDB_READ_TOKEN not set");
+
+  const url = `https://api.themoviedb.org/3/search/${type}?query=${encodeURIComponent(
+    query
+  )}`;
+
+  const r = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${TMDB_READ_TOKEN}`,
+      Accept: "application/json",
+    },
+  });
+
+  if (!r.ok) throw new Error(`TMDB ${r.status}`);
+  return r.json();
 }
 
 // ============================================================
 //   ROUTES
 // ============================================================
-app.get("/", (_, res) => res.send("Zylo Backend ✅ Running"));
 
-// Debug bypass
-app.get("/api/debug/bypass", async (_, res) => {
+app.get("/", (_, res) => res.send("Zylo Backend v2 ✅ Running"));
+
+// --- Debug: Test net27.cc with a TMDB ID ---
+app.get("/api/debug/streams", async (req, res) => {
   try {
-    const c = await bypass();
+    const tmdbId = req.query.id || "27205"; // Inception default
+    const type = req.query.type || "movie";
+    const data = await getStreams(tmdbId, type);
     res.json({
-      ok: !!c,
-      cookie_preview: c ? c.slice(0, 20) + "..." : null,
+      ok: true,
+      title: data.title,
+      year: data.year,
+      streams: data.streams,
+      hls: data.hls,
+      subtitles: data.subtitles,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Debug resolve
-app.get("/api/debug/resolve", async (_, res) => {
+// --- Streams endpoint ---
+app.get("/api/streams", async (req, res) => {
   try {
-    const apiBase = await resolveApiUrl();
-    res.json({ apiBase });
+    const tmdbId = req.query.id;
+    const type = req.query.type || "movie";
+    const season = req.query.s ? parseInt(req.query.s, 10) : null;
+    const episode = req.query.e ? parseInt(req.query.e, 10) : null;
+
+    if (!tmdbId) return res.status(400).json({ error: "id required" });
+
+    const data = await getStreams(tmdbId, type, season, episode);
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Provider routes
-["netflix", "prime", "disney", "hotstar"].forEach((provider) => {
-  app.get(`/api/${provider}/search`, async (req, res) => {
-    try {
-      res.json(await handleSearch(provider, req.query.q || ""));
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-  app.get(`/api/${provider}/load`, async (req, res) => {
-    try {
-      res.json(await handleLoad(provider, req.query.id || ""));
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-  app.get(`/api/${provider}/links`, async (req, res) => {
-    try {
-      res.json(await handleLinks(provider, req.query.id || ""));
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
-  });
+// --- TMDB search (optional) ---
+app.get("/api/search", async (req, res) => {
+  try {
+    const q = req.query.q;
+    const type = req.query.type || "movie";
+    if (!q) return res.status(400).json({ error: "q required" });
+    const data = await tmdbSearch(q, type);
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ---------------- HLS Proxy ----------------
+// ============================================================
+//   STREAM PROXY — for mp4 + HLS with referer
+// ============================================================
 app.get("/api/proxy", async (req, res) => {
   try {
     const target = req.query.url;
-    if (!target) return res.status(400).send("Missing url");
+    if (!target) return res.status(400).send("url required");
 
-    const referer = req.query.referer || new URL(target).origin;
+    const referer = req.query.referer || NET27_REFERER;
 
     const r = await fetch(target, {
       headers: {
         "User-Agent": USER_AGENT,
         Referer: referer,
         Origin: new URL(referer).origin,
-        Cookie: "hd=on",
         Accept: "*/*",
       },
     });
 
     res.setHeader("Access-Control-Allow-Origin", "*");
+
+    if (!r.ok) {
+      return res.status(r.status).send(`upstream ${r.status}`);
+    }
 
     const ctype = r.headers.get("content-type") || "";
     const isM3u8 = target.includes(".m3u8") || ctype.includes("mpegurl");
@@ -345,9 +180,21 @@ app.get("/api/proxy", async (req, res) => {
         .join("\n");
 
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.send(text);
+      return res.send(text);
+    }
+
+    // For mp4 and segments — stream chunks
+    res.setHeader("Content-Type", ctype || "application/octet-stream");
+
+    if (r.body) {
+      const reader = r.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(Buffer.from(value));
+      }
+      res.end();
     } else {
-      res.setHeader("Content-Type", ctype || "application/octet-stream");
       const buf = Buffer.from(await r.arrayBuffer());
       res.send(buf);
     }
@@ -357,5 +204,5 @@ app.get("/api/proxy", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Zylo Backend running on port ${PORT}`);
+  console.log(`✅ Zylo Backend v2 running on port ${PORT}`);
 });
