@@ -1,7 +1,6 @@
 // ============================================================
-//   Zylo Backend v2 — COMPLETE
-//   Primary: net27.cc (fast, single source)
-//   Fallback: TMDB-Embed-API (13 providers, 95%+ coverage)
+//   Zylo Backend v3 — TMDB-Embed-API only
+//   13 providers · 95%+ coverage
 // ============================================================
 
 import express from "express";
@@ -17,94 +16,70 @@ const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ---------------- Config ----------------
-const NET27_REFERER = "https://videodownloader.site/";
-const NET27_ORIGIN = "https://videodownloader.site";
-const NET27_BASE = "https://net27.cc";
-
-// ⭐ TMDB-Embed-API (13 providers fallback)
+// ⭐ TMDB-Embed-API (13 providers)
 const TMDB_EMBED_API = "https://pi-c1oy.onrender.com";
 
 // ============================================================
-//   PRIMARY SOURCE — net27.cc
+//   Get streams from TMDB-Embed-API
 // ============================================================
 async function getStreams(tmdbId, type = "movie", season = null, episode = null) {
-  let url = `${NET27_BASE}/api/embed-tmdb/${tmdbId}`;
-  if (type === "tv" && season !== null && episode !== null) {
-    url += `?type=tv&s=${season}&e=${episode}`;
-  }
-
-  console.log("[net27] Fetching:", url);
-
-  const r = await fetch(url, {
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      "Accept-Language": "en-US,en;q=0.9",
-      Referer: NET27_REFERER,
-      Origin: NET27_ORIGIN,
-      "User-Agent": USER_AGENT,
-    },
-  });
-
-  const text = await r.text();
-  if (!r.ok) {
-    throw new Error(`net27.cc ${r.status}: ${text.slice(0, 150)}`);
-  }
-
-  const j = JSON.parse(text);
-  if (!j.ok) {
-    throw new Error(j.error || "no source available");
-  }
-  return j;
-}
-
-// ============================================================
-//   FALLBACK SOURCE — TMDB-Embed-API (13 providers)
-// ============================================================
-async function getStreamsV2(tmdbId, type = "movie", season = null, episode = null) {
   let url = `${TMDB_EMBED_API}/api/streams/${type}/${tmdbId}`;
   if (type === "tv" && season !== null && episode !== null) {
     url += `?season=${season}&episode=${episode}`;
   }
 
-  console.log("[tmdb-embed] Fetching:", url);
+  console.log("[streams] Fetching:", url);
 
   const r = await fetch(url);
   const text = await r.text();
+
   if (!r.ok) {
-    throw new Error(`tmdb-embed ${r.status}: ${text.slice(0, 150)}`);
+    throw new Error(`TMDB-Embed ${r.status}: ${text.slice(0, 150)}`);
   }
 
   const data = JSON.parse(text);
 
-  // Normalize response
+  // Normalize streams
   const streams = (data.streams || []).map((s) => ({
     url: s.url,
     resolution: parseInt(String(s.quality).replace(/[^\d]/g, ""), 10) || 720,
-    label: s.title || s.quality,
-    provider: s.provider,
+    label: s.title || s.quality || "Auto",
+    provider: s.provider || "unknown",
     headers: s.headers || null,
+    subtitles: s.subtitles || [],
   }));
+
+  // Sort by resolution (best first)
+  streams.sort((a, b) => b.resolution - a.resolution);
+
+  // Collect all subtitles from streams
+  const allSubs = [];
+  streams.forEach((s) => {
+    (s.subtitles || []).forEach((sub) => {
+      if (sub.url && sub.lang) {
+        allSubs.push({ lang: sub.lang, url: sub.url, label: sub.lang });
+      }
+    });
+  });
 
   return {
     ok: streams.length > 0,
-    title: data.title,
+    title: data.title || null,
     streams: streams,
     hls: null,
-    subtitles: [],
-    providers: data.providerTimings || data.providers,
+    subtitles: allSubs,
+    providers: data.providerTimings || data.providers || {},
   };
 }
 
 // ============================================================
 //   ROUTES
 // ============================================================
-app.get("/", (_, res) => res.send("Zylo Backend v2 ✅ Running"));
+app.get("/", (_, res) => res.send("Zylo Backend v3 ✅ Running (TMDB-Embed)"));
 
-// Health
 app.get("/api/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Debug: Primary only (net27.cc)
+// Debug — direct test
 app.get("/api/debug/streams", async (req, res) => {
   try {
     const tmdbId = req.query.id || "27205";
@@ -112,20 +87,17 @@ app.get("/api/debug/streams", async (req, res) => {
     const data = await getStreams(tmdbId, type);
     res.json({
       ok: true,
-      source: "net27.cc",
       title: data.title,
-      streams: data.streams,
-      hls: data.hls,
-      subtitles: data.subtitles,
+      streamCount: data.streams.length,
+      streams: data.streams.slice(0, 3),
+      providers: data.providers,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ============================================================
-//   PRIMARY — /api/streams (net27.cc)
-// ============================================================
+// Main streams endpoint
 app.get("/api/streams", async (req, res) => {
   try {
     const tmdbId = req.query.id;
@@ -139,13 +111,11 @@ app.get("/api/streams", async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error("[streams] error:", e.message);
-    res.status(500).json({ error: e.message, source: "net27.cc" });
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ============================================================
-//   FALLBACK — /api/streams-v2 (TMDB-Embed-API, 13 providers)
-// ============================================================
+// Alias — same as /api/streams (frontend compatibility)
 app.get("/api/streams-v2", async (req, res) => {
   try {
     const tmdbId = req.query.id;
@@ -155,81 +125,55 @@ app.get("/api/streams-v2", async (req, res) => {
 
     if (!tmdbId) return res.status(400).json({ error: "id required" });
 
-    const data = await getStreamsV2(tmdbId, type, season, episode);
+    const data = await getStreams(tmdbId, type, season, episode);
     res.json(data);
   } catch (e) {
     console.error("[streams-v2] error:", e.message);
-    res.status(500).json({ error: e.message, source: "tmdb-embed" });
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ============================================================
-//   COMBINED — /api/streams-all
-//   Pehle net27.cc try karega, agar fail ho to TMDB-Embed-API
-// ============================================================
+// Alias — same (frontend compatibility)
 app.get("/api/streams-all", async (req, res) => {
-  const tmdbId = req.query.id;
-  const type = req.query.type || "movie";
-  const season = req.query.s ? parseInt(req.query.s, 10) : null;
-  const episode = req.query.e ? parseInt(req.query.e, 10) : null;
-
-  if (!tmdbId) return res.status(400).json({ error: "id required" });
-
-  // ---- 1. Try primary (net27.cc) ----
   try {
-    const primary = await getStreams(tmdbId, type, season, episode);
-    if (primary.streams?.length > 0 || primary.hls) {
-      return res.json({
-        ...primary,
-        source: "net27.cc",
-        fallbackUsed: false,
-      });
-    }
-  } catch (e) {
-    console.warn("[streams-all] Primary failed:", e.message);
-  }
+    const tmdbId = req.query.id;
+    const type = req.query.type || "movie";
+    const season = req.query.s ? parseInt(req.query.s, 10) : null;
+    const episode = req.query.e ? parseInt(req.query.e, 10) : null;
 
-  // ---- 2. Try fallback (TMDB-Embed-API) ----
-  try {
-    const fallback = await getStreamsV2(tmdbId, type, season, episode);
-    if (fallback.streams?.length > 0) {
-      return res.json({
-        ...fallback,
-        source: "tmdb-embed",
-        fallbackUsed: true,
-      });
-    }
-  } catch (e) {
-    console.warn("[streams-all] Fallback failed:", e.message);
-  }
+    if (!tmdbId) return res.status(400).json({ error: "id required" });
 
-  // ---- 3. Both failed ----
-  res.status(404).json({
-    ok: false,
-    error: "No source available from any provider",
-    source: "none",
-  });
+    const data = await getStreams(tmdbId, type, season, episode);
+    res.json({ ...data, source: "tmdb-embed", fallbackUsed: false });
+  } catch (e) {
+    console.error("[streams-all] error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ============================================================
-//   STREAM PROXY — HLS + MP4 with referer forwarding
+//   STREAM PROXY — HLS + MP4
 // ============================================================
 app.get("/api/proxy", async (req, res) => {
   try {
     const target = req.query.url;
     if (!target) return res.status(400).send("url required");
 
-    const referer = req.query.referer || NET27_REFERER;
+    const referer = req.query.referer || "";
 
-    const r = await fetch(target, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        Referer: referer,
-        Origin: new URL(referer).origin,
-        Accept: "*/*",
-        Range: req.headers.range || "",
-      },
-    });
+    const headers = {
+      "User-Agent": USER_AGENT,
+      Accept: "*/*",
+    };
+    if (referer) {
+      headers["Referer"] = referer;
+      try {
+        headers["Origin"] = new URL(referer).origin;
+      } catch {}
+    }
+    if (req.headers.range) headers["Range"] = req.headers.range;
+
+    const r = await fetch(target, { headers });
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "*");
@@ -259,12 +203,14 @@ app.get("/api/proxy", async (req, res) => {
           if (t.startsWith("#EXT-X-KEY")) {
             return t.replace(/URI="([^"]+)"/, (_, u) => {
               const abs = u.startsWith("http") ? u : new URL(u, baseUrl).href;
-              return `URI="/api/proxy?url=${encodeURIComponent(abs)}&referer=${encodeURIComponent(referer)}"`;
+              const refParam = referer ? `&referer=${encodeURIComponent(referer)}` : "";
+              return `URI="/api/proxy?url=${encodeURIComponent(abs)}${refParam}"`;
             });
           }
           if (t.startsWith("#")) return line;
           const abs = t.startsWith("http") ? t : new URL(t, baseUrl).href;
-          return `/api/proxy?url=${encodeURIComponent(abs)}&referer=${encodeURIComponent(referer)}`;
+          const refParam = referer ? `&referer=${encodeURIComponent(referer)}` : "";
+          return `/api/proxy?url=${encodeURIComponent(abs)}${refParam}`;
         })
         .join("\n");
 
@@ -293,7 +239,6 @@ app.get("/api/proxy", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Zylo Backend v2 running on port ${PORT}`);
-  console.log(`   Primary: net27.cc`);
-  console.log(`   Fallback: ${TMDB_EMBED_API}`);
+  console.log(`✅ Zylo Backend v3 running on port ${PORT}`);
+  console.log(`   Source: ${TMDB_EMBED_API}`);
 });
