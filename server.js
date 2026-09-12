@@ -1,6 +1,6 @@
 // ============================================================
-//   Zylo Backend v3 — TMDB-Embed-API only
-//   13 providers · 95%+ coverage
+//   Zylo Backend v4 — FINAL (with TV/SERIES fix + timeout)
+//   Source: TMDB-Embed-API (13 providers)
 // ============================================================
 
 import express from "express";
@@ -16,70 +16,87 @@ const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ⭐ TMDB-Embed-API (13 providers)
-const TMDB_EMBED_API = " https://tmdb-embed-api-c1oy.onrender.com";
+const TMDB_EMBED_API = "https://tmdb-embed-api-c1oy.onrender.com";
 
 // ============================================================
-//   Get streams from TMDB-Embed-API
+//   Get streams — with type fix + timeout
 // ============================================================
 async function getStreams(tmdbId, type = "movie", season = null, episode = null) {
-  let url = `${TMDB_EMBED_API}/api/streams/${type}/${tmdbId}`;
-  if (type === "tv" && season !== null && episode !== null) {
+  // ⭐ FIX 1: TMDB-Embed-API "series" maangta hai, "tv" nahi
+  const apiType = type === "tv" ? "series" : type;
+
+  let url = `${TMDB_EMBED_API}/api/streams/${apiType}/${tmdbId}`;
+  if (apiType === "series" && season !== null && episode !== null) {
     url += `?season=${season}&episode=${episode}`;
   }
 
   console.log("[streams] Fetching:", url);
 
-  const r = await fetch(url);
-  const text = await r.text();
+  // ⭐ FIX 2: 25 second timeout (Render free tier 30s pe cut karta hai)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 25000);
 
-  if (!r.ok) {
-    throw new Error(`TMDB-Embed ${r.status}: ${text.slice(0, 150)}`);
-  }
-
-  const data = JSON.parse(text);
-
-  // Normalize streams
-  const streams = (data.streams || []).map((s) => ({
-    url: s.url,
-    resolution: parseInt(String(s.quality).replace(/[^\d]/g, ""), 10) || 720,
-    label: s.title || s.quality || "Auto",
-    provider: s.provider || "unknown",
-    headers: s.headers || null,
-    subtitles: s.subtitles || [],
-  }));
-
-  // Sort by resolution (best first)
-  streams.sort((a, b) => b.resolution - a.resolution);
-
-  // Collect all subtitles from streams
-  const allSubs = [];
-  streams.forEach((s) => {
-    (s.subtitles || []).forEach((sub) => {
-      if (sub.url && sub.lang) {
-        allSubs.push({ lang: sub.lang, url: sub.url, label: sub.lang });
-      }
+  try {
+    const r = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        "User-Agent": USER_AGENT,
+      },
     });
-  });
 
-  return {
-    ok: streams.length > 0,
-    title: data.title || null,
-    streams: streams,
-    hls: null,
-    subtitles: allSubs,
-    providers: data.providerTimings || data.providers || {},
-  };
+    clearTimeout(timeoutId);
+    const text = await r.text();
+
+    if (!r.ok) {
+      throw new Error(`TMDB-Embed ${r.status}: ${text.slice(0, 150)}`);
+    }
+
+    const data = JSON.parse(text);
+    const streams = (data.streams || []).map((s) => ({
+      url: s.url,
+      resolution: parseInt(String(s.quality).replace(/[^\d]/g, ""), 10) || 720,
+      label: s.title || s.quality || "Auto",
+      provider: s.provider || "unknown",
+      headers: s.headers || null,
+      subtitles: s.subtitles || [],
+    }));
+
+    streams.sort((a, b) => b.resolution - a.resolution);
+
+    const allSubs = [];
+    streams.forEach((s) => {
+      (s.subtitles || []).forEach((sub) => {
+        if (sub.url && sub.lang) {
+          allSubs.push({ lang: sub.lang, url: sub.url, label: sub.lang });
+        }
+      });
+    });
+
+    return {
+      ok: streams.length > 0,
+      title: data.title || null,
+      streams: streams,
+      hls: null,
+      subtitles: allSubs,
+      providers: data.providerTimings || data.providers || {},
+    };
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (e.name === "AbortError") {
+      throw new Error("Request timeout — server might be waking up, please retry");
+    }
+    throw e;
+  }
 }
 
 // ============================================================
 //   ROUTES
 // ============================================================
-app.get("/", (_, res) => res.send("Zylo Backend v3 ✅ Running (TMDB-Embed)"));
+app.get("/", (_, res) => res.send("Zylo Backend v4 ✅ Running"));
 
 app.get("/api/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Debug — direct test
 app.get("/api/debug/streams", async (req, res) => {
   try {
     const tmdbId = req.query.id || "27205";
@@ -97,7 +114,6 @@ app.get("/api/debug/streams", async (req, res) => {
   }
 });
 
-// Main streams endpoint
 app.get("/api/streams", async (req, res) => {
   try {
     const tmdbId = req.query.id;
@@ -111,11 +127,14 @@ app.get("/api/streams", async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error("[streams] error:", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(200).json({
+      ok: false,
+      streams: [],
+      error: e.message,
+    });
   }
 });
 
-// Alias — same as /api/streams (frontend compatibility)
 app.get("/api/streams-v2", async (req, res) => {
   try {
     const tmdbId = req.query.id;
@@ -128,31 +147,12 @@ app.get("/api/streams-v2", async (req, res) => {
     const data = await getStreams(tmdbId, type, season, episode);
     res.json(data);
   } catch (e) {
-    console.error("[streams-v2] error:", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Alias — same (frontend compatibility)
-app.get("/api/streams-all", async (req, res) => {
-  try {
-    const tmdbId = req.query.id;
-    const type = req.query.type || "movie";
-    const season = req.query.s ? parseInt(req.query.s, 10) : null;
-    const episode = req.query.e ? parseInt(req.query.e, 10) : null;
-
-    if (!tmdbId) return res.status(400).json({ error: "id required" });
-
-    const data = await getStreams(tmdbId, type, season, episode);
-    res.json({ ...data, source: "tmdb-embed", fallbackUsed: false });
-  } catch (e) {
-    console.error("[streams-all] error:", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(200).json({ ok: false, streams: [], error: e.message });
   }
 });
 
 // ============================================================
-//   STREAM PROXY — HLS + MP4
+//   STREAM PROXY
 // ============================================================
 app.get("/api/proxy", async (req, res) => {
   try {
@@ -194,7 +194,6 @@ app.get("/api/proxy", async (req, res) => {
     if (isM3u8) {
       let text = await r.text();
       const baseUrl = target.substring(0, target.lastIndexOf("/") + 1);
-
       text = text
         .split("\n")
         .map((line) => {
@@ -213,7 +212,6 @@ app.get("/api/proxy", async (req, res) => {
           return `/api/proxy?url=${encodeURIComponent(abs)}${refParam}`;
         })
         .join("\n");
-
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       return res.send(text);
     }
@@ -239,6 +237,6 @@ app.get("/api/proxy", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Zylo Backend v3 running on port ${PORT}`);
+  console.log(`✅ Zylo Backend v4 running on port ${PORT}`);
   console.log(`   Source: ${TMDB_EMBED_API}`);
 });
