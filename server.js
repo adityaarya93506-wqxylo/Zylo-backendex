@@ -70,7 +70,7 @@ async function getStreams(tmdbId, type = "movie", season = null, episode = null)
   console.log("[streams] Fetching:", url);
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 25000);
+  const timeoutId = setTimeout(() => controller.abort(), 90000);
 
   try {
     const r = await fetch(url, {
