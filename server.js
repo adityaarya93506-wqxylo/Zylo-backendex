@@ -17,7 +17,7 @@ const USER_AGENT =
   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // ⭐ TMDB-Embed-API (13 providers)
-const TMDB_EMBED_API = "https://pi-c1oy.onrender.com";
+const TMDB_EMBED_API = " https://tmdb-embed-api-c1oy.onrender.com";
 
 // ============================================================
 //   Get streams from TMDB-Embed-API
