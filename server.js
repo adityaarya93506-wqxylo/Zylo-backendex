@@ -653,4 +653,223 @@ app.get("/api/tv-info", async (req, res) => {
           const seasonUrl = new URL(
             `https://api.themoviedb.org/3/tv/${encodeURIComponent(
               tmdbId
-     
+            )}/season/${encodeURIComponent(season.season_number)}`
+          );
+          seasonUrl.searchParams.set("api_key", TMDB_API_KEY);
+          seasonUrl.searchParams.set("language", "en-US");
+
+          const r = await fetch(seasonUrl.href, {
+            headers: { Accept: "application/json", "User-Agent": USER_AGENT },
+          });
+          if (!r.ok) return { episodes: [] };
+          return await r.json();
+        } catch {
+          return { episodes: [] };
+        }
+      })
+    );
+
+    const seasons = validSeasons.map((season, index) => ({
+      season: season.season_number,
+      name: season.name,
+      episodes: Array.isArray(seasonResults[index]?.episodes)
+        ? seasonResults[index].episodes.map((episode) => ({
+            episode: episode.episode_number,
+            name: episode.name,
+            overview: episode.overview,
+            still_path: episode.still_path,
+            air_date: episode.air_date,
+          }))
+        : [],
+    }));
+
+    res.json({ id: details.id, name: details.name, seasons });
+  } catch (e) {
+    console.error("[tv-info]", e?.message || e);
+    res.status(500).json({ error: e?.message || "TV info failed" });
+  }
+});
+
+// ============================================================
+// PROXY
+// ============================================================
+
+async function handleProxy(req, res) {
+  try {
+    const targetUrl = String(req.query.url || "").trim();
+    if (!targetUrl) return res.status(400).send("url required");
+
+    validateUpstreamUrl(targetUrl);
+
+    const referer = getSafeReferer(req.query.referer);
+    const range = req.headers.range || null;
+    const likelyManifest = isHlsUrl(targetUrl);
+
+    const upstream = await fetchUpstream(targetUrl, {
+      method: req.method === "HEAD" ? "HEAD" : "GET",
+      referer,
+      range: likelyManifest ? null : range,
+      timeoutMs: likelyManifest ? 20000 : 45000,
+      accept: likelyManifest
+        ? "application/vnd.apple.mpegurl,*/*;q=0.8"
+        : "*/*",
+    });
+
+    const r = upstream.response;
+    const finalUrl = upstream.finalUrl;
+
+    const contentType = (r.headers.get("content-type") || "").toLowerCase();
+    const finalIsHls =
+      isHlsUrl(finalUrl) ||
+      contentType.includes("mpegurl") ||
+      contentType.includes("vnd.apple.mpegurl");
+
+    if (!r.ok && r.status !== 206) {
+      return res.status(r.status).send(`upstream ${r.status}`);
+    }
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader(
+      "Access-Control-Expose-Headers",
+      "Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag"
+    );
+
+    // HEAD
+    if (req.method === "HEAD") {
+      if (finalIsHls) {
+        res.status(r.status);
+        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+        res.setHeader("Cache-Control", "no-store");
+        return res.end();
+      }
+      for (const h of [
+        "content-type",
+        "content-length",
+        "content-range",
+        "accept-ranges",
+        "etag",
+        "last-modified",
+        "cache-control",
+      ]) {
+        const v = r.headers.get(h);
+        if (v) res.setHeader(h, v);
+      }
+      return res.status(r.status).end();
+    }
+
+    // HLS MANIFEST
+    if (finalIsHls) {
+      const text = await r.text();
+      const rewritten = rewriteHlsManifest(text, finalUrl, referer);
+
+      res.status(r.status === 206 ? 200 : r.status);
+      res.removeHeader("Content-Length");
+      res.removeHeader("ETag");
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      return res.send(rewritten);
+    }
+
+    // MEDIA
+    for (const h of [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges",
+      "etag",
+      "last-modified",
+    ]) {
+      const v = r.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+
+    res.status(r.status);
+
+    if (!r.headers.get("content-type")) {
+      res.setHeader("Content-Type", "application/octet-stream");
+    }
+
+    if (!r.body) {
+      const buffer = Buffer.from(await r.arrayBuffer());
+      return res.end(buffer);
+    }
+
+    const reader = r.body.getReader();
+    const cleanup = () => {
+      try {
+        reader.cancel();
+      } catch {}
+    };
+
+    req.on("aborted", cleanup);
+    res.on("close", cleanup);
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        if (!res.write(Buffer.from(value))) {
+          await new Promise((resolve) => res.once("drain", resolve));
+        }
+      }
+      res.end();
+    } catch (streamError) {
+      cleanup();
+      if (!res.headersSent) return res.status(502).send("Upstream stream error");
+      try {
+        res.end();
+      } catch {}
+    } finally {
+      req.off("aborted", cleanup);
+      res.off("close", cleanup);
+    }
+  } catch (e) {
+    console.error("[proxy]", e?.message || e);
+    if (res.headersSent) {
+      try {
+        res.end();
+      } catch {}
+      return;
+    }
+    const message = e?.message || "Proxy error";
+    if (/not allowed/i.test(message)) {
+      return res.status(403).send("Upstream host not allowed");
+    }
+    return res.status(502).send(`Proxy error: ${message}`);
+  }
+}
+
+app.get("/api/proxy", handleProxy);
+app.head("/api/proxy", handleProxy);
+
+// 404
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "Not found" });
+});
+
+// ERROR HANDLER
+app.use((err, _req, res, _next) => {
+  console.error("[server]", err?.message || err);
+  if (res.headersSent) return;
+  if (/CORS/i.test(err?.message || "")) {
+    return res.status(403).json({ ok: false, error: "CORS origin not allowed" });
+  }
+  res.status(500).json({ ok: false, error: "Internal server error" });
+});
+
+// START
+app.listen(PORT, () => {
+  console.log(`✅ Zylo Backend v9.2 running on port ${PORT}`);
+  console.log(`   TMDB Embed API: ${TMDB_EMBED_API}`);
+  console.log(
+    `   Upstream mode: ${
+      ENFORCE_ALLOWLIST
+        ? "ALLOWLIST ENFORCED (" + ALLOWED_UPSTREAM_HOSTS.join(", ") + ")"
+        : "OPEN (all public hosts, private blocked)"
+    }`
+  );
+  console.log(
+    `   TMDB Key: ${TMDB_API_KEY ? "✅ Set" : "❌ Missing (tv-info will fail)"}`
+  );
+});
