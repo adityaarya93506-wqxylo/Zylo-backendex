@@ -1,79 +1,409 @@
 // ============================================================
-//   Zylo Backend v5 — FINAL
-//   TMDB-Embed-API (13 providers) + Proxy 206 + TV Info + Multi-Audio
+//   Zylo Backend v9.2 — Secure + Real Language Detection
+//   ✓ Raw streams passthrough (no fake grouping)
+//   ✓ Real language detection (only genuinely different URLs)
+//   ✓ Full HLS URI rewriting
+//   ✓ Correct Range / 206 handling
+//   ✓ Private/local URL blocking (SSRF protection)
+//   ✓ Redirect validation
+//   ✓ Manifest Content-Length/ETag removal after rewrite
+//   ✓ TMDB key from environment
+//   ✓ Optional host allowlist (open by default for 13 providers)
 // ============================================================
 
 import express from "express";
 import cors from "cors";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  process.env.STREAM_USER_AGENT ||
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+    "Chrome/120.0.0.0 Safari/537.36";
 
-// ⭐ URLs
-const TMDB_EMBED_API = "https://tmdb-embed-api-c1oy.onrender.com";
+const TMDB_EMBED_API =
+  process.env.TMDB_EMBED_API ||
+  "https://tmdb-embed-api-c1oy.onrender.com";
 
-// ⭐ TMDB API Key (fallback hardcoded — Render Environment overrides this)
-const TMDB_API_KEY = process.env.TMDB_API_KEY || "226cd3ee9998d07c2548d14f7e19a5da";
+const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
 
-// ⭐ Language detect patterns (title se)
-const LANG_PATTERNS = [
-  { regex: /\bhindi\b/i, code: "hi", name: "Hindi" },
-  { regex: /\benglish\b/i, code: "en", name: "English" },
-  { regex: /\btamil\b/i, code: "ta", name: "Tamil" },
-  { regex: /\btelugu\b/i, code: "te", name: "Telugu" },
-  { regex: /\bmalayalam\b/i, code: "ml", name: "Malayalam" },
-  { regex: /\bkannada\b/i, code: "kn", name: "Kannada" },
-  { regex: /\bbengali\b/i, code: "bn", name: "Bengali" },
-  { regex: /\bmarathi\b/i, code: "mr", name: "Marathi" },
-  { regex: /\bpunjabi\b/i, code: "pa", name: "Punjabi" },
-  { regex: /\burdu\b/i, code: "ur", name: "Urdu" },
-  { regex: /\bspanish\b|\bespañol\b/i, code: "es", name: "Spanish" },
-  { regex: /\bfrench\b|\bfrançais\b/i, code: "fr", name: "French" },
-  { regex: /\bgerman\b|\bdeutsch\b/i, code: "de", name: "German" },
-  { regex: /\bjapanese\b|\b日本語\b/i, code: "ja", name: "Japanese" },
-  { regex: /\bkorean\b|\b한국어\b/i, code: "ko", name: "Korean" },
-  { regex: /\bchinese\b|\b中文\b/i, code: "zh", name: "Chinese" },
-  { regex: /\bitalian\b|\bitaliano\b/i, code: "it", name: "Italian" },
-  { regex: /\bportuguese\b|\bportuguês\b/i, code: "pt", name: "Portuguese" },
-  { regex: /\brussian\b|\bрусский\b/i, code: "ru", name: "Russian" },
-  { regex: /\barabic\b|\bالعربية\b/i, code: "ar", name: "Arabic" },
-];
+// ------------------------------------------------------------
+// CORS
+// ------------------------------------------------------------
 
-// ============================================================
-//   Helper: detect language from a stream's label/title
-// ============================================================
-function detectLanguage(text = "") {
-  for (const p of LANG_PATTERNS) {
-    if (p.regex.test(text)) return { code: p.code, name: p.name };
-  }
+const DEFAULT_ORIGINS = ["*"];
+
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || DEFAULT_ORIGINS.join(","))
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
+      if (CORS_ORIGINS.includes("*")) return callback(null, true);
+      if (CORS_ORIGINS.includes(origin)) return callback(null, true);
+      return callback(new Error("CORS origin not allowed"));
+    },
+    methods: ["GET", "HEAD", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Range",
+      "Accept",
+      "Origin",
+      "Referer",
+      "User-Agent",
+    ],
+    exposedHeaders: [
+      "Accept-Ranges",
+      "Content-Length",
+      "Content-Range",
+      "Content-Type",
+      "ETag",
+    ],
+    credentials: false,
+  })
+);
+
+app.use(express.json({ limit: "100kb" }));
+
+// ------------------------------------------------------------
+// SECURITY HEADERS
+// ------------------------------------------------------------
+
+app.disable("x-powered-by");
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  next();
+});
+
+// ------------------------------------------------------------
+// LANGUAGE MAP
+// ------------------------------------------------------------
+
+const LANG_NAMES = {
+  hi: "Hindi", en: "English", ta: "Tamil", te: "Telugu", ml: "Malayalam",
+  kn: "Kannada", bn: "Bengali", mr: "Marathi", pa: "Punjabi", ur: "Urdu",
+  es: "Spanish", fr: "French", de: "German", ja: "Japanese", ko: "Korean",
+  zh: "Chinese", ar: "Arabic", ru: "Russian", it: "Italian", pt: "Portuguese",
+};
+
+const LANG_ALIASES = {
+  hin: "hi", hindi: "hi", eng: "en", english: "en",
+  tam: "ta", tamil: "ta", tel: "te", telugu: "te",
+  mal: "ml", malayalam: "ml", kan: "kn", kannada: "kn",
+  ben: "bn", bengali: "bn", mar: "mr", marathi: "mr",
+  pan: "pa", punjabi: "pa", urd: "ur", urdu: "ur",
+  spa: "es", spanish: "es", fra: "fr", fre: "fr", french: "fr",
+  deu: "de", ger: "de", german: "de", jpn: "ja", japanese: "ja",
+  kor: "ko", korean: "ko", zho: "zh", chi: "zh", chinese: "zh",
+  ara: "ar", arabic: "ar", rus: "ru", russian: "ru",
+  ita: "it", italian: "it", por: "pt", portuguese: "pt",
+};
+
+function normalizeLang(code) {
+  if (!code) return null;
+  let value = String(code).trim().toLowerCase().replace(/_/g, "-");
+  if (value.includes("-")) value = value.split("-")[0];
+  if (LANG_ALIASES[value]) return LANG_ALIASES[value];
+  if (LANG_NAMES[value]) return value;
   return null;
 }
 
-// ============================================================
-//   getStreams — with type fix + timeout + audio grouping
-// ============================================================
-async function getStreams(tmdbId, type = "movie", season = null, episode = null) {
-  const apiType = type === "tv" ? "series" : type;
+// ------------------------------------------------------------
+// RESOLUTION
+// ------------------------------------------------------------
 
-  let url = `${TMDB_EMBED_API}/api/streams/${apiType}/${tmdbId}`;
-  if (apiType === "series" && season !== null && episode !== null) {
-    url += `?season=${season}&episode=${episode}`;
+function parseResolution(value) {
+  if (value == null) return null;
+  const match = String(value).match(/(\d{3,4})/);
+  if (!match) return null;
+  const n = Number(match[1]);
+  if (!Number.isFinite(n)) return null;
+  if (n < 144 || n > 4320) return null;
+  return n;
+}
+
+// ------------------------------------------------------------
+// HLS DETECTION
+// ------------------------------------------------------------
+
+function isHlsUrl(url = "") {
+  try {
+    const u = new URL(url);
+    const path = u.pathname.toLowerCase();
+    if (path.endsWith(".m3u8")) return true;
+    const content = `${u.pathname}${u.search}`.toLowerCase();
+    return (
+      content.includes(".m3u8") ||
+      content.includes("m3u8") ||
+      /\/hls(?:\/|$)/i.test(u.pathname) ||
+      /playlist/i.test(u.pathname)
+    );
+  } catch {
+    const value = String(url).toLowerCase();
+    return (
+      value.includes(".m3u8") ||
+      value.includes("m3u8") ||
+      value.includes("/hls/") ||
+      value.includes("playlist")
+    );
+  }
+}
+
+// ------------------------------------------------------------
+// SAFE URL HELPERS
+// ------------------------------------------------------------
+
+function parseHttpUrl(value) {
+  if (!value || typeof value !== "string") throw new Error("Invalid URL");
+  if (value.length > 8192) throw new Error("URL too long");
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Only HTTP/HTTPS URLs are allowed");
+  }
+  return url;
+}
+
+function isPrivateOrLocalHostname(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
+
+  if (
+    host === "localhost" ||
+    host === "localhost.localdomain" ||
+    host === "ip6-localhost" ||
+    host === "ip6-loopback" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
+  ) {
+    return true;
   }
 
-  console.log("[streams] Fetching:", url);
+  if (host === "::1" || host === "0.0.0.0") return true;
+
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const parts = ipv4.slice(1).map(Number);
+    if (parts.some((n) => n < 0 || n > 255)) return true;
+    const [a, b] = parts;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true;
+    if (a >= 224) return true;
+  }
+
+  if (host.includes(":")) {
+    if (host.startsWith("fc") || host.startsWith("fd")) return true;
+    if (host.startsWith("fe8")) return true;
+    if (host.startsWith("fe9")) return true;
+    if (host.startsWith("fea")) return true;
+    if (host.startsWith("feb")) return true;
+  }
+
+  return false;
+}
+
+// ------------------------------------------------------------
+// UPSTREAM ALLOWLIST (optional)
+// ------------------------------------------------------------
+
+const ALLOWED_UPSTREAM_HOSTS = (process.env.ALLOWED_UPSTREAM_HOSTS || "")
+  .split(",")
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+
+const ENFORCE_ALLOWLIST = ALLOWED_UPSTREAM_HOSTS.length > 0;
+
+function isAllowedUpstreamHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
+  if (!host) return false;
+
+  if (isPrivateOrLocalHostname(host)) return false;
+
+  if (!ENFORCE_ALLOWLIST) return true;
+
+  return ALLOWED_UPSTREAM_HOSTS.some((allowed) => {
+    if (!allowed) return false;
+    if (allowed === host) return true;
+    if (allowed.startsWith("*.")) {
+      const base = allowed.slice(2);
+      return host === base || host.endsWith(`.${base}`);
+    }
+    return false;
+  });
+}
+
+function validateUpstreamUrl(value) {
+  const url = parseHttpUrl(value);
+  if (!isAllowedUpstreamHost(url.hostname)) {
+    throw new Error(`Upstream host not allowed: ${url.hostname}`);
+  }
+  return url;
+}
+
+// ------------------------------------------------------------
+// SAFE REFERER
+// ------------------------------------------------------------
+
+function getSafeReferer(rawReferer) {
+  if (!rawReferer) return null;
+  if (String(rawReferer).length > 2048) return null;
+  try {
+    const ref = new URL(String(rawReferer));
+    if (ref.protocol !== "http:" && ref.protocol !== "https:") return null;
+    return ref.href;
+  } catch {
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
+// FETCH WITH VALIDATED REDIRECTS
+// ------------------------------------------------------------
+
+async function fetchUpstream(initialUrl, options = {}) {
+  let currentUrl = validateUpstreamUrl(initialUrl);
+  const maxRedirects = 5;
+
+  for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
+    const controller = new AbortController();
+    const timeoutMs = Number(options.timeoutMs || 45000);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const headers = {
+        "User-Agent": USER_AGENT,
+        Accept: options.accept || "*/*",
+      };
+
+      if (options.referer) {
+        headers.Referer = options.referer;
+        try {
+          headers.Origin = new URL(options.referer).origin;
+        } catch {}
+      }
+
+      if (options.range) headers.Range = options.range;
+
+      const response = await fetch(currentUrl.href, {
+        method: options.method || "GET",
+        headers,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        if (redirectCount >= maxRedirects) {
+          throw new Error("Too many upstream redirects");
+        }
+        const location = response.headers.get("location");
+        if (!location) throw new Error("Upstream redirect missing Location");
+
+        const nextUrl = new URL(location, currentUrl.href);
+        validateUpstreamUrl(nextUrl.href);
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      return { response, finalUrl: currentUrl.href };
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error?.name === "AbortError") throw new Error("Upstream request timeout");
+      throw error;
+    }
+  }
+  throw new Error("Upstream redirect failure");
+}
+
+// ------------------------------------------------------------
+// HLS REWRITE
+// ------------------------------------------------------------
+
+function buildProxyUrl(targetUrl, referer) {
+  const proxy = new URL("/api/proxy", "http://zylo.local");
+  proxy.searchParams.set("url", targetUrl);
+  if (referer) proxy.searchParams.set("referer", referer);
+  return `${proxy.pathname}${proxy.search}`;
+}
+
+function rewriteHlsManifest(text, baseUrl, referer) {
+  const lines = text.split(/\r?\n/);
+
+  const rewriteUri = (rawValue) => {
+    if (!rawValue) return rawValue;
+    const value = rawValue.trim();
+    if (
+      value.startsWith("data:") ||
+      value.startsWith("blob:") ||
+      value.startsWith("#")
+    ) {
+      return value;
+    }
+    try {
+      const absolute = new URL(value, baseUrl);
+      validateUpstreamUrl(absolute.href);
+      return buildProxyUrl(absolute.href, referer);
+    } catch {
+      return value;
+    }
+  };
+
+  return lines
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+
+      if (trimmed.startsWith("#")) {
+        if (!/URI=/i.test(line)) return line;
+        return line.replace(
+          /URI\s*=\s*"([^"]+)"/gi,
+          (_, uri) => `URI="${rewriteUri(uri)}"`
+        );
+      }
+      return rewriteUri(trimmed);
+    })
+    .join("\n");
+}
+
+// ------------------------------------------------------------
+// GET STREAMS — Real Language Detection (v9.2)
+// ------------------------------------------------------------
+
+async function getStreams(tmdbId, type = "movie", season = null, episode = null) {
+  if (!tmdbId) throw new Error("TMDB id required");
+
+  const apiType = type === "tv" ? "series" : "movie";
+
+  let url =
+    `${TMDB_EMBED_API}/api/streams/${apiType}/` +
+    encodeURIComponent(String(tmdbId));
+
+  if (apiType === "series" && season != null && episode != null) {
+    url +=
+      `?season=${encodeURIComponent(String(season))}` +
+      `&episode=${encodeURIComponent(String(episode))}`;
+  }
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 90000);
 
   try {
     const r = await fetch(url, {
+      method: "GET",
       signal: controller.signal,
       headers: {
         Accept: "application/json",
@@ -81,302 +411,246 @@ async function getStreams(tmdbId, type = "movie", season = null, episode = null)
       },
     });
 
-    clearTimeout(timeoutId);
     const text = await r.text();
+    if (!r.ok) throw new Error(`TMDB-Embed ${r.status}: ${text.slice(0, 150)}`);
 
-    if (!r.ok) {
-      throw new Error(`TMDB-Embed ${r.status}: ${text.slice(0, 150)}`);
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error("Invalid streams JSON");
     }
 
-    const data = JSON.parse(text);
+    const raw = Array.isArray(data.streams) ? data.streams : [];
 
-    // ========================================================
-    //   NORMALIZE STREAMS
-    // ========================================================
-    const rawStreams = data.streams || [];
+    // ------------------------------------------------
+    // NORMALIZE STREAMS
+    // ------------------------------------------------
+    const streams = raw
+      .map((s) => {
+        const streamUrl = typeof s?.url === "string" ? s.url.trim() : "";
+        if (!streamUrl) return null;
 
-    const streams = rawStreams.map((s) => {
-      const labelText = `${s.title || ""} ${s.name || ""} ${s.quality || ""}`;
-      const detected = detectLanguage(labelText);
+        let parsedUrl;
+        try {
+          parsedUrl = parseHttpUrl(streamUrl);
+        } catch {
+          return null;
+        }
 
-      return {
-        url: s.url,
-        resolution: parseInt(String(s.quality).replace(/[^\d]/g, ""), 10) || 720,
-        label: s.title || s.quality || "Auto",
-        provider: s.provider || "unknown",
-        lang: s.lang || s.language || (detected ? detected.code : null),
-        langName: detected ? detected.name : null,
-        headers: s.headers || null,
-        subtitles: s.subtitles || [],
-      };
-    });
+        const rawLang = s.lang ?? s.language ?? s.audio_language ?? null;
+        const lang = normalizeLang(rawLang);
 
-    streams.sort((a, b) => b.resolution - a.resolution);
+        const resolution = parseResolution(
+          s.quality ?? s.resolution ?? s.height ?? null
+        );
 
-    // ========================================================
-    //   GLOBAL MULTI-AUDIO EXTRACTION
-    //   Saari languages jo bhi kisi bhi stream me mile
-    // ========================================================
-    const audioMap = new Map(); // langCode → { lang, label, url, resolution }
-    streams.forEach((s) => {
-      const code = s.lang || "default";
-      const name = s.langName || "Default";
-      const existing = audioMap.get(code);
-      if (!existing || s.resolution > existing.resolution) {
-        audioMap.set(code, {
-          lang: code,
-          label: name,
-          url: s.url,
-          resolution: s.resolution,
+        return {
+          url: parsedUrl.href,
+          type: isHlsUrl(parsedUrl.href) ? "hls" : "mp4",
+          resolution,
+          quality:
+            s.quality != null
+              ? String(s.quality)
+              : resolution
+              ? `${resolution}p`
+              : null,
+          label: s.title || (resolution ? `${resolution}p` : "Auto"),
+          provider:
+            s.provider != null ? String(s.provider) : "unknown",
+          lang,
+          subtitles: Array.isArray(s.subtitles)
+            ? s.subtitles
+                .map((sub) => {
+                  if (!sub?.url) return null;
+                  try {
+                    const subUrl = parseHttpUrl(String(sub.url));
+                    return {
+                      url: subUrl.href,
+                      lang:
+                        normalizeLang(sub.lang || sub.language) ||
+                        String(sub.lang || sub.language || "und")
+                          .toLowerCase()
+                          .trim(),
+                      label:
+                        sub.label || sub.name || sub.lang || "Subtitle",
+                    };
+                  } catch {
+                    return null;
+                  }
+                })
+                .filter(Boolean)
+            : [],
+        };
+      })
+      .filter(Boolean);
+
+    // ------------------------------------------------
+    // ⭐ REAL LANGUAGE DETECTION
+    //
+    // Only include a language if its best stream URL
+    // is UNIQUE (not shared with another language).
+    // This filters out fake language labels.
+    // ------------------------------------------------
+    const langBestMap = new Map(); // langCode → stream
+    for (const stream of streams) {
+      if (!stream.lang) continue;
+      const existing = langBestMap.get(stream.lang);
+      if (!existing || (stream.resolution || 0) > (existing.resolution || 0)) {
+        langBestMap.set(stream.lang, stream);
+      }
+    }
+
+    // Build URL → list of langs map
+    const urlToLangs = new Map();
+    for (const [langCode, stream] of langBestMap.entries()) {
+      if (!urlToLangs.has(stream.url)) urlToLangs.set(stream.url, []);
+      urlToLangs.get(stream.url).push(langCode);
+    }
+
+    // Only keep languages whose URL is unique
+    const languages = [];
+    for (const [langCode, stream] of langBestMap.entries()) {
+      const langsForUrl = urlToLangs.get(stream.url) || [];
+      if (langsForUrl.length === 1) {
+        languages.push({
+          code: langCode,
+          name: LANG_NAMES[langCode] || langCode.toUpperCase(),
         });
       }
-    });
-
-    const audioTracks = Array.from(audioMap.values());
-    if (audioTracks.length === 0 && streams.length > 0) {
-      audioTracks.push({
-        lang: "default",
-        label: "Default",
-        url: streams[0].url,
-        resolution: streams[0].resolution,
-      });
     }
 
-    // ========================================================
-    //   SUBTITLES
-    // ========================================================
-    const allSubs = [];
-    const seenSubs = new Set();
-    streams.forEach((s) => {
-      (s.subtitles || []).forEach((sub) => {
-        if (sub.url && sub.lang && !seenSubs.has(sub.lang)) {
-          seenSubs.add(sub.lang);
-          allSubs.push({
-            lang: sub.lang,
+    // ------------------------------------------------
+    // SUBTITLES
+    // ------------------------------------------------
+    const subtitleMap = new Map();
+    for (const stream of streams) {
+      for (const sub of stream.subtitles || []) {
+        if (!sub?.url) continue;
+        const key = `${sub.lang || "und"}|${sub.url}`;
+        if (!subtitleMap.has(key)) {
+          subtitleMap.set(key, {
+            lang: sub.lang || "und",
             url: sub.url,
-            label: sub.lang,
+            label:
+              sub.label || LANG_NAMES[sub.lang] || sub.lang || "Subtitle",
           });
         }
-      });
-    });
+      }
+    }
 
     return {
       ok: streams.length > 0,
       title: data.title || null,
-      streams: streams,
-      hls: null,
-      subtitles: allSubs,
-      audioTracks: audioTracks,
+      streams,
+      languages,
+      subtitles: Array.from(subtitleMap.values()),
       providers: data.providerTimings || data.providers || {},
     };
   } catch (e) {
-    clearTimeout(timeoutId);
-    if (e.name === "AbortError") {
-      throw new Error("Request timeout — server waking up, please retry");
-    }
+    if (e?.name === "AbortError") throw new Error("Request timeout — retry");
     throw e;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
-// ============================================================
-//   ROUTES
-// ============================================================
-app.get("/", (_, res) => res.send("Zylo Backend v5 ✅ Running"));
+// ------------------------------------------------------------
+// ROUTES
+// ------------------------------------------------------------
 
-app.get("/api/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
+app.get("/", (_req, res) => res.send("Zylo Backend v9.2 ✅"));
+
+app.get("/api/health", (_req, res) =>
+  res.json({ ok: true, version: "v9.2", ts: Date.now() })
+);
 
 app.get("/api/debug/streams", async (req, res) => {
   try {
-    const tmdbId = req.query.id || "27205";
-    const type = req.query.type || "movie";
-    const data = await getStreams(tmdbId, type);
+    const data = await getStreams(
+      req.query.id || "27205",
+      req.query.type || "movie"
+    );
     res.json({
       ok: true,
       title: data.title,
       streamCount: data.streams.length,
-      audioTracks: data.audioTracks,
-      subtitleCount: data.subtitles.length,
-      streams: data.streams.slice(0, 3),
+      languages: data.languages,
+      sampleStreams: data.streams.slice(0, 5),
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e?.message || "Debug failed" });
   }
 });
 
 app.get("/api/streams", async (req, res) => {
   try {
-    const tmdbId = req.query.id;
-    const type = req.query.type || "movie";
-    const season = req.query.s ? parseInt(req.query.s, 10) : null;
-    const episode = req.query.e ? parseInt(req.query.e, 10) : null;
+    const tmdbId = String(req.query.id || "").trim();
+    if (!tmdbId) {
+      return res
+        .status(400)
+        .json({ ok: false, streams: [], error: "id required" });
+    }
 
-    if (!tmdbId) return res.status(400).json({ error: "id required" });
+    const type = req.query.type === "tv" ? "tv" : "movie";
+    const season =
+      req.query.s != null && /^\d+$/.test(String(req.query.s))
+        ? Number(req.query.s)
+        : null;
+    const episode =
+      req.query.e != null && /^\d+$/.test(String(req.query.e))
+        ? Number(req.query.e)
+        : null;
 
     const data = await getStreams(tmdbId, type, season, episode);
     res.json(data);
   } catch (e) {
-    console.error("[streams] error:", e.message);
-    res.status(200).json({ ok: false, streams: [], error: e.message });
+    console.error("[streams]", e?.message || e);
+    res.status(200).json({
+      ok: false,
+      streams: [],
+      error: e?.message || "Streams unavailable",
+    });
   }
 });
 
-// ============================================================
-//   ⭐ TV INFO — Seasons & Episodes from TMDB
-// ============================================================
-app.get("/api/tv-info", async (req, res) => {
-  const tmdbId = req.query.id;
-  if (!tmdbId) return res.status(400).json({ error: "id required" });
+// ------------------------------------------------------------
+// TV INFO
+// ------------------------------------------------------------
 
+app.get("/api/tv-info", async (req, res) => {
+  const tmdbId = String(req.query.id || "").trim();
+  if (!tmdbId) return res.status(400).json({ error: "id required" });
   if (!TMDB_API_KEY) {
-    return res.status(500).json({ error: "TMDB_API_KEY not configured" });
+    return res
+      .status(500)
+      .json({ error: "TMDB_API_KEY environment variable missing" });
   }
 
   try {
-    const detailsRes = await fetch(
-      `https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${TMDB_API_KEY}&language=en-US`
+    const detailsUrl = new URL(
+      `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}`
     );
+    detailsUrl.searchParams.set("api_key", TMDB_API_KEY);
+    detailsUrl.searchParams.set("language", "en-US");
+
+    const detailsRes = await fetch(detailsUrl.href, {
+      headers: { Accept: "application/json", "User-Agent": USER_AGENT },
+    });
     const details = await detailsRes.json();
 
-    if (details.success === false) {
-      throw new Error(details.status_message || "TMDB error");
+    if (!detailsRes.ok || details.success === false) {
+      throw new Error(details.status_message || `TMDB ${detailsRes.status}`);
     }
 
-    const seasons = [];
-    const validSeasons = (details.seasons || []).filter(
-      (s) => s.season_number > 0
-    );
+    const validSeasons = Array.isArray(details.seasons)
+      ? details.seasons.filter((s) => Number(s.season_number) > 0)
+      : [];
 
     const seasonResults = await Promise.all(
-      validSeasons.map((s) =>
-        fetch(
-          `https://api.themoviedb.org/3/tv/${tmdbId}/season/${s.season_number}?api_key=${TMDB_API_KEY}&language=en-US`
-        )
-          .then((r) => r.json())
-          .catch(() => ({ episodes: [] }))
-      )
-    );
-
-    validSeasons.forEach((s, i) => {
-      const epData = seasonResults[i];
-      seasons.push({
-        season: s.season_number,
-        name: s.name,
-        episode_count: s.episode_count,
-        episodes: (epData.episodes || []).map((e) => ({
-          episode: e.episode_number,
-          name: e.name,
-          overview: e.overview,
-          still_path: e.still_path,
-          air_date: e.air_date,
-          runtime: e.runtime,
-        })),
-      });
-    });
-
-    res.json({
-      id: details.id,
-      name: details.name,
-      number_of_seasons: details.number_of_seasons,
-      seasons,
-    });
-  } catch (e) {
-    console.error("[tv-info] error:", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ============================================================
-//   ⭐ STREAM PROXY — with 206 Partial Content support
-// ============================================================
-app.get("/api/proxy", async (req, res) => {
-  try {
-    const target = req.query.url;
-    if (!target) return res.status(400).send("url required");
-
-    const referer = req.query.referer || "";
-
-    const headers = {
-      "User-Agent": USER_AGENT,
-      Accept: "*/*",
-    };
-    if (referer) {
-      headers["Referer"] = referer;
-      try {
-        headers["Origin"] = new URL(referer).origin;
-      } catch {}
-    }
-    // ⭐ Forward Range header for seeking
-    if (req.headers.range) headers["Range"] = req.headers.range;
-
-    const r = await fetch(target, { headers });
-
-    // CORS headers
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "*");
-    res.setHeader("Access-Control-Expose-Headers", "*");
-
-    if (!r.ok && r.status !== 206) {
-      return res.status(r.status).send(`upstream ${r.status}`);
-    }
-
-    // ⭐⭐ CRITICAL: Forward 200/206 status
-    res.status(r.status);
-
-    ["content-type", "content-length", "content-range", "accept-ranges"].forEach((h) => {
-      const v = r.headers.get(h);
-      if (v) res.setHeader(h, v);
-    });
-
-    const ctype = r.headers.get("content-type") || "";
-    const isM3u8 = target.includes(".m3u8") || ctype.includes("mpegurl");
-
-    if (isM3u8) {
-      let text = await r.text();
-      const baseUrl = target.substring(0, target.lastIndexOf("/") + 1);
-      text = text
-        .split("\n")
-        .map((line) => {
-          const t = line.trim();
-          if (!t) return line;
-          if (t.startsWith("#EXT-X-KEY")) {
-            return t.replace(/URI="([^"]+)"/, (_, u) => {
-              const abs = u.startsWith("http") ? u : new URL(u, baseUrl).href;
-              const refParam = referer ? `&referer=${encodeURIComponent(referer)}` : "";
-              return `URI="/api/proxy?url=${encodeURIComponent(abs)}${refParam}"`;
-            });
-          }
-          if (t.startsWith("#")) return line;
-          const abs = t.startsWith("http") ? t : new URL(t, baseUrl).href;
-          const refParam = referer ? `&referer=${encodeURIComponent(referer)}` : "";
-          return `/api/proxy?url=${encodeURIComponent(abs)}${refParam}`;
-        })
-        .join("\n");
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      return res.send(text);
-    }
-
-    res.setHeader("Content-Type", ctype || "application/octet-stream");
-
-    if (r.body) {
-      const reader = r.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        res.write(Buffer.from(value));
-      }
-      res.end();
-    } else {
-      const buf = Buffer.from(await r.arrayBuffer());
-      res.send(buf);
-    }
-  } catch (e) {
-    console.error("[proxy]", e.message);
-    res.status(500).send("Proxy error: " + e.message);
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`✅ Zylo Backend v5 running on port ${PORT}`);
-  console.log(`   Source: ${TMDB_EMBED_API}`);
-  console.log(`   TMDB Key: ${TMDB_API_KEY ? "✅ Set (" + TMDB_API_KEY.slice(0, 8) + "...)" : "❌ Missing"}`);
-});
+      validSeasons.map(async (season) => {
+        try {
+          const seasonUrl = new URL(
+            `https://api.themoviedb.org/3/tv/${encodeURIComponent(
+              tmdbId
+     
