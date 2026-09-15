@@ -1,6 +1,6 @@
 // ============================================================
-//   Zylo Backend v11 — JSON Metadata Only
-//   ✓ Streams from TMDB-Embed-API
+//   Zylo Backend v12 — JSON Metadata Only
+//   ✓ Streams from TMDB-Embed-API (movie | series)
 //   ✓ TV Info from TMDB
 //   ✓ TMDB Proxy
 //   ✓ /api/proxy → redirect to CF Worker (bandwidth bachao)
@@ -176,16 +176,16 @@ function parseHttpUrl(value) {
 }
 
 // ------------------------------------------------------------
-// getStreams — calls TMDB-Embed-API
+// ⭐⭐⭐ getStreams — TV ke liye "series" bhejna hai ⭐⭐⭐
 // ------------------------------------------------------------
 async function getStreams(tmdbId, type = "movie", season = null, episode = null) {
   if (!tmdbId) throw new Error("TMDB id required");
 
-  // TMDB-Embed-API accepts: movie | series | tv
-  const apiType = type === "tv" ? "tv" : "movie";
+  // ⭐ TMDB-Embed-API "series" accept karta hai, "tv" nahi
+  const apiType = type === "tv" ? "series" : "movie";
 
   let url = `${TMDB_EMBED_API}/api/streams/${apiType}/${encodeURIComponent(String(tmdbId))}`;
-  if (apiType === "tv" && season != null && episode != null) {
+  if (apiType === "series" && season != null && episode != null) {
     url += `?season=${season}&episode=${episode}`;
   }
 
@@ -203,8 +203,6 @@ async function getStreams(tmdbId, type = "movie", season = null, episode = null)
     if (!r.ok) throw new Error(`TMDB-Embed ${r.status}: ${text.slice(0, 150)}`);
 
     const data = JSON.parse(text);
-
-    // TMDB-Embed-API returns: { success, tmdbId, imdbId, count, providerTimings, streams }
     const raw = Array.isArray(data.streams) ? data.streams : [];
 
     const streams = raw
@@ -227,7 +225,6 @@ async function getStreams(tmdbId, type = "movie", season = null, episode = null)
           label: s.title || s.name || (resolution ? `${resolution}p` : "Auto"),
           provider: s.provider != null ? String(s.provider) : "unknown",
           lang,
-          // ⭐ Provider headers passthrough (NetMirror ka Referer: net52.cc)
           headers: s.headers && typeof s.headers === "object" ? s.headers : {},
           subtitles: Array.isArray(s.subtitles)
             ? s.subtitles
@@ -254,7 +251,6 @@ async function getStreams(tmdbId, type = "movie", season = null, episode = null)
       return (b.resolution || 0) - (a.resolution || 0);
     });
 
-    // Real languages (only from explicit lang)
     const langSet = new Set();
     streams.forEach((s) => { if (s.lang) langSet.add(s.lang); });
     const languages = Array.from(langSet).map((code) => ({
@@ -262,7 +258,6 @@ async function getStreams(tmdbId, type = "movie", season = null, episode = null)
       name: LANG_NAMES[code] || code.toUpperCase(),
     }));
 
-    // Subtitles dedupe
     const subMap = new Map();
     streams.forEach((s) => {
       (s.subtitles || []).forEach((sub) => {
@@ -415,11 +410,11 @@ app.head("/api/proxy", (req, res) => {
 // ------------------------------------------------------------
 // Health
 // ------------------------------------------------------------
-app.get("/", (_req, res) => res.send("Zylo Backend v11 ✅"));
+app.get("/", (_req, res) => res.send("Zylo Backend v12 ✅"));
 app.get("/api/health", (_req, res) =>
   res.json({
     ok: true,
-    version: "v11",
+    version: "v12",
     tmdb: !!TMDB_API_KEY,
     embed: TMDB_EMBED_API,
     cfWorker: CF_WORKER,
@@ -431,7 +426,7 @@ app.get("/api/health", (_req, res) =>
 app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Zylo Backend v11 running on port ${PORT}`);
+  console.log(`✅ Zylo Backend v12 running on port ${PORT}`);
   console.log(`   TMDB Embed API: ${TMDB_EMBED_API}`);
   console.log(`   CF Worker: ${CF_WORKER}`);
   console.log(`   TMDB Key: ${TMDB_API_KEY ? "✅ Set" : "❌ Missing"}`);
